@@ -75,6 +75,17 @@ pip install -r requirements.txt
 python main.py
 ```
 
+**MQTT:** o broker padrão é `broker.hivemq.com` (porta 1883). Se der timeout na rede da universidade/rede corporativa, use:
+
+```powershell
+# Só voz e receita (sem ESP32)
+python main.py --no-mqtt
+
+# Ou outro broker
+$env:MQTT_BROKER="mqtt.eclipseprojects.io"
+python main.py
+```
+
 **Nota (Windows):** se `PyAudio` falhar na instalação, use:
 
 ```bash
@@ -87,8 +98,8 @@ pipwin install pyaudio
 Com a simulação Wokwi rodando:
 
 ```bash
-mosquitto_sub -h test.mosquitto.org -t kitchen/temperature
-mosquitto_pub -h test.mosquitto.org -t kitchen/command -m start
+mosquitto_sub -h broker.hivemq.com -t kitchen/temperature
+mosquitto_pub -h broker.hivemq.com -t kitchen/command -m start
 ```
 
 ## Tópicos MQTT
@@ -98,6 +109,18 @@ mosquitto_pub -h test.mosquitto.org -t kitchen/command -m start
 | `kitchen/temperature` | ESP32 → Python | `{"temperature":28.0,"humidity":50.0}` |
 | `kitchen/command` | Python → ESP32 | `start`, `next`, `alert` |
 | `kitchen/status` | ESP32 → (monitor) | `{"status":"started","last_command":"start"}` |
+
+## Build local do firmware (PlatformIO)
+
+```powershell
+pip install platformio
+cd controller
+$env:PIP_USER="0"   # necessário no Python da Microsoft Store
+python -m platformio run
+```
+
+O firmware compilado fica em `controller/.pio/build/esp32dev/firmware.bin`.  
+Edite sempre `esp32_wokwi.ino` (Wokwi); o build local copia automaticamente para `src/main.ino`.
 
 ## Receita de exemplo
 

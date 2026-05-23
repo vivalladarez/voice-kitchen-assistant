@@ -4,7 +4,9 @@ Assistente de voz para preparo de receitas — MVP.
 Escuta comandos pelo microfone, responde por voz e envia ações ao ESP32 via MQTT.
 """
 
+import argparse
 import json
+import os
 import threading
 import time
 
@@ -14,14 +16,21 @@ import speech_recognition as sr
 
 from recipes import RECIPE, TEMP_WARNING_C, TEMP_WARNING_MSG
 
-MQTT_BROKER = "test.mosquitto.org"
-MQTT_PORT = 1883
 TOPIC_TEMP = "kitchen/temperature"
 TOPIC_CMD = "kitchen/command"
 
+# Brokers públicos (algumas redes bloqueiam test.mosquitto.org na porta 1883)
+MQTT_BROKERS = [
+    (os.environ.get("MQTT_BROKER", "test.mosquitto.org"), int(os.environ.get("MQTT_PORT", "1883"))),
+    ("broker.hivemq.com", 1883),
+    ("mqtt.eclipseprojects.io", 1883),
+]
+
 COMMANDS = {
     "começar receita": "start",
+    "começar a receita": "start",
     "comecar receita": "start",
+    "comecar a receita": "start",
     "iniciar receita": "start",
     "próximo passo": "next",
     "proximo passo": "next",
@@ -29,9 +38,13 @@ COMMANDS = {
     "qual a temperatura": "temperature",
 }
 
+DEMO_START_TEMP = 32.0
+DEMO_TEMP_STEP = 4.0
+DEMO_TEMP_INTERVAL_S = 8
+
 
 class KitchenAssistant:
-    def __init__(self) -> None:
+    def __init__(self, *, mqtt_enabled: bool = True, demo: bool = False) -> None:
         self.tts = pyttsx3.init()
         self.tts.setProperty("rate", 160)
 
@@ -42,18 +55,84 @@ class KitchenAssistant:
         self.last_temperature: float | None = None
         self._temp_warned = False
         self._lock = threading.Lock()
+        self.demo = demo
 
+        self.mqtt_enabled = mqtt_enabled and not demo
+        self.mqtt_connected = False
+        self.mqtt: mqtt.Client | None = None
+        self._mqtt_stop = threading.Event()
+
+        if demo:
+            print("Modo demo — sensor simulado, sem Wokwi/MQTT.")
+            threading.Thread(target=self._demo_sensor_loop, daemon=True).start()
+        elif mqtt_enabled:
+            self._setup_mqtt()
+        else:
+            print("MQTT desabilitado — assistente só com voz e receita.")
+
+    def _demo_sensor_loop(self) -> None:
+        temp = DEMO_START_TEMP
+        while True:
+            with self._lock:
+                self.last_temperature = temp
+                should_warn = temp > TEMP_WARNING_C and not self._temp_warned
+                if should_warn:
+                    self._temp_warned = True
+
+            print(f"Sensor demo: {temp:.0f}°C")
+            if should_warn:
+                threading.Thread(target=self._handle_hot_pan, daemon=True).start()
+
+            time.sleep(DEMO_TEMP_INTERVAL_S)
+            temp += DEMO_TEMP_STEP
+
+    def _setup_mqtt(self) -> None:
         self.mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self.mqtt.on_connect = self._on_connect
         self.mqtt.on_message = self._on_message
-        self.mqtt.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
         self.mqtt.loop_start()
+        threading.Thread(target=self._mqtt_connect_loop, daemon=True).start()
+
+    def _mqtt_connect_loop(self) -> None:
+        while not self._mqtt_stop.is_set():
+            if self.mqtt is None:
+                return
+            if self.mqtt_connected:
+                time.sleep(2)
+                continue
+
+            for host, port in MQTT_BROKERS:
+                if self._mqtt_stop.is_set():
+                    return
+                print(f"MQTT: tentando {host}:{port}...")
+                try:
+                    self.mqtt.connect_async(host, port, keepalive=60)
+                except OSError as exc:
+                    print(f"MQTT: falha em {host}:{port} — {exc}")
+                    continue
+
+                for _ in range(30):
+                    if self.mqtt_connected:
+                        print(f"MQTT conectado em {host}:{port}")
+                        return
+                    time.sleep(0.2)
+
+                try:
+                    self.mqtt.disconnect()
+                except OSError:
+                    pass
+                self.mqtt_connected = False
+
+            print("MQTT: sem conexão. Nova tentativa em 10 s...")
+            time.sleep(10)
 
     def _on_connect(self, client, userdata, flags, reason_code, properties) -> None:
         if reason_code == 0:
+            self.mqtt_connected = True
             client.subscribe(TOPIC_TEMP)
             print(f"MQTT conectado — inscrito em {TOPIC_TEMP}")
         else:
+            self.mqtt_connected = False
             print(f"MQTT falhou: {reason_code}")
 
     def _on_message(self, client, userdata, msg) -> None:
@@ -82,6 +161,11 @@ class KitchenAssistant:
         self.tts.runAndWait()
 
     def publish_command(self, cmd: str) -> None:
+        if not self.mqtt_enabled or self.mqtt is None:
+            return
+        if not self.mqtt_connected:
+            print(f"MQTT offline — comando não enviado: {cmd}")
+            return
         self.mqtt.publish(TOPIC_CMD, cmd)
         print(f"MQTT → {TOPIC_CMD}: {cmd}")
 
@@ -106,9 +190,18 @@ class KitchenAssistant:
         return None
 
     def match_command(self, text: str) -> str | None:
+        normalized = text.replace(" a ", " ").replace("  ", " ")
+
         for phrase, action in COMMANDS.items():
-            if phrase in text:
+            if phrase in normalized or phrase in text:
                 return action
+
+        if any(w in text for w in ("comecar", "começar", "iniciar", "comeca", "começa")) and "receita" in text:
+            return "start"
+        if any(w in text for w in ("proximo", "próximo", "proxim")) and "passo" in text:
+            return "next"
+        if "temperatura" in text or "temperatur" in text:
+            return "temperature"
         return None
 
     def handle_start(self) -> None:
@@ -156,10 +249,16 @@ class KitchenAssistant:
             )
 
     def run(self) -> None:
-        self.speak(
+        if self.mqtt_enabled and not self.mqtt_connected:
+            print("Aguardando MQTT em segundo plano (voz já funciona)...")
+
+        msg = (
             f"Olá! Assistente de cozinha pronto. "
             f"Receita: {RECIPE['name']}. Diga começar receita para iniciar."
         )
+        if self.mqtt_enabled and not self.mqtt_connected:
+            msg += " Modo voz ativo; ESP32 quando o MQTT conectar."
+        self.speak(msg)
 
         while True:
             text = self.listen()
@@ -169,13 +268,24 @@ class KitchenAssistant:
 
 
 def main() -> None:
-    assistant = KitchenAssistant()
+    parser = argparse.ArgumentParser(description="Assistente de cozinha por voz")
+    parser.add_argument(
+        "--no-mqtt",
+        action="store_true",
+        help="Roda só voz/receita, sem conectar ao broker MQTT",
+    )
+    args = parser.parse_args()
+
+    assistant = KitchenAssistant(mqtt_enabled=not args.no_mqtt)
     try:
         assistant.run()
     except KeyboardInterrupt:
         print("\nEncerrando...")
-        assistant.mqtt.loop_stop()
-        assistant.mqtt.disconnect()
+        assistant._mqtt_stop.set()
+        if assistant.mqtt is not None:
+            assistant.mqtt.loop_stop()
+            if assistant.mqtt_connected:
+                assistant.mqtt.disconnect()
 
 
 if __name__ == "__main__":

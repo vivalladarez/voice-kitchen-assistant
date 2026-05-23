@@ -32,8 +32,16 @@ static const char *WIFI_SSID = "Wokwi-GUEST";
 static const char *WIFI_PASS = "";
 
 // --- MQTT ---
-static const char *MQTT_BROKER = "test.mosquitto.org";
+// Brokers públicos — o Wokwi tenta em ordem até um conectar
+static const char *MQTT_BROKERS[] = {
+    "test.mosquitto.org",
+    "mqtt.eclipseprojects.io",
+    "broker.emqx.io",
+};
+static const size_t MQTT_BROKER_COUNT =
+    sizeof(MQTT_BROKERS) / sizeof(MQTT_BROKERS[0]);
 static const uint16_t MQTT_PORT = 1883;
+static const char *MQTT_CLIENT_ID = "voice-kitchen-wokwi";
 static const char *TOPIC_TEMP = "kitchen/temperature";
 static const char *TOPIC_CMD = "kitchen/command";
 static const char *TOPIC_STATUS = "kitchen/status";
@@ -54,23 +62,36 @@ static const unsigned long TEMP_INTERVAL_MS = 5000;
 static bool ledOn = false;
 static bool alertMode = false;
 static unsigned long lastAlertBeepMs = 0;
+static uint8_t mqttBrokerIndex = 0;
+static unsigned long lastMqttAttemptMs = 0;
 
 static void connectWiFi();
 static void connectMQTT();
+static bool testTcp(const char *host, uint16_t port);
 static void mqttCallback(char *topic, byte *payload, unsigned int length);
 static void handleCommand(const String &cmd);
 static void publishTemperature();
 static void publishStatus(const char *status);
 static void refreshOled(float tempC);
 static void beepAck();
+static bool readDht(TempAndHumidity &reading);
 
 void setup() {
   Serial.begin(115200);
+  delay(100);
 
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
   digitalWrite(PIN_LED, LOW);
   noTone(PIN_BUZZER);
+
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(256);
+  mqtt.setKeepAlive(60);
+  mqtt.setSocketTimeout(10);
+
+  connectWiFi();
+  connectMQTT();
 
   Wire.begin(I2C_SDA, I2C_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
@@ -89,13 +110,9 @@ void setup() {
 
   dht.setup(PIN_DHT, DHTesp::DHT22);
 
-  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-  mqtt.setCallback(mqttCallback);
-  mqtt.setBufferSize(256);
-
-  connectWiFi();
-  connectMQTT();
-  publishStatus("online");
+  if (mqtt.connected()) {
+    publishStatus("online");
+  }
   refreshOled(NAN);
 }
 
@@ -127,6 +144,8 @@ void loop() {
       digitalWrite(PIN_LED, ledOn ? HIGH : LOW);
     }
   }
+
+  delay(10); // recomendado pelo Wokwi para rede simulada
 }
 
 static void mqttCallback(char *topic, byte *payload, unsigned int length) {
@@ -168,13 +187,18 @@ static void handleCommand(const String &cmd) {
     publishStatus("unknown_command");
   }
 
-  TempAndHumidity reading = dht.getTempAndHumidity();
-  refreshOled(reading.isValid ? reading.temperature : NAN);
+  TempAndHumidity reading;
+  refreshOled(readDht(reading) ? reading.temperature : NAN);
+}
+
+static bool readDht(TempAndHumidity &reading) {
+  reading = dht.getTempAndHumidity();
+  return dht.getStatus() == DHTesp::ERROR_NONE;
 }
 
 static void publishTemperature() {
-  TempAndHumidity reading = dht.getTempAndHumidity();
-  if (!reading.isValid) {
+  TempAndHumidity reading;
+  if (!readDht(reading)) {
     Serial.println(F("DHT22 read failed"));
     publishStatus("dht_error");
     return;
@@ -229,7 +253,7 @@ static void connectWiFi() {
   }
   Serial.printf("WiFi: connecting to %s\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(WIFI_SSID, WIFI_PASS, 6);
 
   uint8_t attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 40) {
@@ -246,18 +270,43 @@ static void connectWiFi() {
   }
 }
 
+static bool testTcp(const char *host, uint16_t port) {
+  WiFiClient probe;
+  Serial.printf("TCP test %s:%u ... ", host, port);
+  const bool ok = probe.connect(host, port, 8000);
+  Serial.println(ok ? F("OK") : F("FAIL"));
+  probe.stop();
+  return ok;
+}
+
 static void connectMQTT() {
-  while (!mqtt.connected()) {
-    const String clientId =
-        String("kitchen-esp32-") + String(random(0xffff), HEX);
-    Serial.printf("MQTT: connecting as %s\n", clientId.c_str());
-    if (mqtt.connect(clientId.c_str())) {
-      Serial.println(F("MQTT connected"));
-      mqtt.subscribe(TOPIC_CMD);
-      publishStatus("mqtt_connected");
-      return;
-    }
-    Serial.printf("MQTT failed, rc=%d\n", mqtt.state());
-    delay(2000);
+  if (mqtt.connected()) {
+    return;
   }
+
+  const unsigned long now = millis();
+  if (now - lastMqttAttemptMs < 3000) {
+    return;
+  }
+  lastMqttAttemptMs = now;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("MQTT: aguardando WiFi"));
+    return;
+  }
+
+  const char *broker = MQTT_BROKERS[mqttBrokerIndex];
+  mqtt.setServer(broker, MQTT_PORT);
+  testTcp(broker, MQTT_PORT);
+
+  Serial.printf("MQTT: %s as %s\n", broker, MQTT_CLIENT_ID);
+  if (mqtt.connect(MQTT_CLIENT_ID)) {
+    Serial.println(F("MQTT connected"));
+    mqtt.subscribe(TOPIC_CMD);
+    publishStatus("mqtt_connected");
+    return;
+  }
+
+  Serial.printf("MQTT failed, rc=%d\n", mqtt.state());
+  mqttBrokerIndex = (mqttBrokerIndex + 1) % MQTT_BROKER_COUNT;
 }
